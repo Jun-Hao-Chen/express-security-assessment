@@ -1,0 +1,315 @@
+--- app.original.js	2026-11-10 02:21:43.642753552 +0800
++++ app.js	2026-11-10 02:21:43.678559247 +0800
+@@ -7,7 +7,8 @@
+ const PORT = process.env.PORT || 3000;
+ const DATA_FILE = path.join(__dirname, 'data', 'messages.json');
+ 
+-app.use(express.urlencoded({ extended: false }));
++// Cap request bodies so a single POST cannot push megabytes into the data file.
++app.use(express.urlencoded({ extended: false, limit: '32kb' }));
+ app.use(express.static(path.join(__dirname, 'public')));
+ 
+ /* ----------------------------------------------------------------------------
+@@ -37,8 +38,44 @@
+   return JSON.parse(file);
+ }
+ 
++// Atomic write: write a temp file next to the data file, then rename it over
++// the original. Readers see either the old file or the new one, never a
++// half-written file that makes JSON.parse throw.
+ async function writeMessages(messages) {
+-  await fs.writeFile(DATA_FILE, JSON.stringify(messages, null, 2));
++  const tempFile = `${DATA_FILE}.${crypto.randomUUID()}.tmp`;
++  await fs.writeFile(tempFile, JSON.stringify(messages, null, 2));
++  await fs.rename(tempFile, DATA_FILE);
++}
++
++// Serialize every read-modify-write cycle. Without this, two requests can read
++// the same old array and the later write silently drops the earlier update.
++// Limitation: this lock only covers a single Node.js process.
++let dataLock = Promise.resolve();
++
++function withDataLock(task) {
++  const run = dataLock.then(() => task());
++  dataLock = run.catch(() => {});
++  return run;
++}
++
++const NAME_MAX_LENGTH = 40;
++const MESSAGE_MAX_LENGTH = 2000;
++
++// One server-side validator for create, reply, and edit. HTML maxlength is only
++// a browser hint; anyone can send a raw POST request.
++function validatePostInput(body) {
++  const name = typeof body.name === 'string' ? body.name.trim() : '';
++  const text = typeof body.message === 'string' ? body.message.trim() : '';
++
++  if (!name || !text) {
++    return { error: 'Name and message are required.' };
++  }
++
++  if (name.length > NAME_MAX_LENGTH || text.length > MESSAGE_MAX_LENGTH) {
++    return { error: 'Input is too long.' };
++  }
++
++  return { name, text };
+ }
+ 
+ /* ----------------------------------------------------------------------------
+@@ -768,26 +805,28 @@
+ 
+ app.post('/messages', async (req, res, next) => {
+   try {
+-    const name = req.body.name.trim();
+-    const text = req.body.message.trim();
++    const input = validatePostInput(req.body);
+ 
+-    if (!name || !text) {
+-      res.status(400).send('Name and message are required.');
++    if (input.error) {
++      res.status(400).send(input.error);
+       return;
+     }
+ 
+     const category = isValidCategory(req.body.category) ? req.body.category : 'general-chat';
+-    const messages = await readMessages();
+-    messages.unshift({
+-      id: Date.now().toString(),
+-      parentId: null,
+-      name,
+-      message: text,
+-      category,
+-      createdAt: new Date().toISOString()
++
++    await withDataLock(async () => {
++      const messages = await readMessages();
++      messages.unshift({
++        id: crypto.randomUUID(),
++        parentId: null,
++        name: input.name,
++        message: input.text,
++        category,
++        createdAt: new Date().toISOString()
++      });
++      await writeMessages(messages);
+     });
+ 
+-    await writeMessages(messages);
+     res.redirect('/');
+   } catch (error) {
+     next(error);
+@@ -828,32 +867,38 @@
+ 
+ app.post('/messages/:id/reply', async (req, res, next) => {
+   try {
+-    const name = req.body.name.trim();
+-    const text = req.body.message.trim();
+-    const messages = await readMessages();
+-    const parent = messages.find((message) => message.id === req.params.id);
++    const input = validatePostInput(req.body);
+ 
+-    if (!parent) {
+-      res.status(404).send('Parent message not found.');
++    if (input.error) {
++      res.status(400).send(input.error);
+       return;
+     }
+ 
+-    if (!name || !text) {
+-      res.status(400).send('Name and message are required.');
+-      return;
+-    }
++    const threadRoot = await withDataLock(async () => {
++      const messages = await readMessages();
++      const parent = messages.find((message) => message.id === req.params.id);
++
++      if (!parent) {
++        return null;
++      }
++
++      messages.unshift({
++        id: crypto.randomUUID(),
++        parentId: parent.id,
++        name: input.name,
++        message: input.text,
++        createdAt: new Date().toISOString()
++      });
+ 
+-    messages.unshift({
+-      id: Date.now().toString(),
+-      parentId: parent.id,
+-      name,
+-      message: text,
+-      createdAt: new Date().toISOString()
++      await writeMessages(messages);
++      return findThreadRoot(messages, parent.id);
+     });
+ 
+-    await writeMessages(messages);
++    if (!threadRoot) {
++      res.status(404).send('Parent message not found.');
++      return;
++    }
+ 
+-    const threadRoot = findThreadRoot(messages, parent.id);
+     res.redirect(`/threads/${threadRoot.id}`);
+   } catch (error) {
+     next(error);
+@@ -862,19 +907,18 @@
+ 
+ app.post('/messages/:id/delete', async (req, res, next) => {
+   try {
+-    const messages = await readMessages();
+-    const threadRoot = findThreadRoot(messages, req.params.id);
+-    const idsToDelete = collectDescendantIds(messages, req.params.id);
+-    const remainingMessages = messages.filter((message) => !idsToDelete.has(message.id));
++    const redirectTo = await withDataLock(async () => {
++      const messages = await readMessages();
++      const threadRoot = findThreadRoot(messages, req.params.id);
++      const idsToDelete = collectDescendantIds(messages, req.params.id);
++      const remainingMessages = messages.filter((message) => !idsToDelete.has(message.id));
+ 
+-    await writeMessages(remainingMessages);
++      await writeMessages(remainingMessages);
+ 
+-    if (threadRoot && !idsToDelete.has(threadRoot.id)) {
+-      res.redirect(`/threads/${threadRoot.id}`);
+-      return;
+-    }
++      return threadRoot && !idsToDelete.has(threadRoot.id) ? `/threads/${threadRoot.id}` : '/';
++    });
+ 
+-    res.redirect('/');
++    res.redirect(redirectTo);
+   } catch (error) {
+     next(error);
+   }
+@@ -905,47 +949,47 @@
+ 
+ app.post('/messages/:id/edit', async (req, res, next) => {
+   try {
+-    const messages = await readMessages();
+-    const target = messages.find((message) => message.id === req.params.id);
++    const input = validatePostInput(req.body);
+ 
+-    if (!target) {
+-      res.status(404).send('Message not found.');
++    if (input.error) {
++      res.status(400).send(input.error);
+       return;
+     }
+ 
+-    const name = (req.body.name || '').trim();
+-    const text = (req.body.message || '').trim();
++    const redirectTo = await withDataLock(async () => {
++      const messages = await readMessages();
++      const target = messages.find((message) => message.id === req.params.id);
+ 
+-    if (!name || !text) {
+-      res.status(400).send('Name and message are required.');
+-      return;
+-    }
++      if (!target) {
++        return null;
++      }
+ 
+-    if (name.length > 40 || text.length > 2000) {
+-      res.status(400).send('Input is too long.');
+-      return;
+-    }
++      const isTopLevel = !target.parentId;
++      target.name = input.name;
++      delete target.text;
++      target.message = input.text;
++
++      if (isTopLevel) {
++        target.category = isValidCategory(req.body.category)
++          ? req.body.category
++          : postCategory(normalizeMessage(target));
++      }
+ 
+-    const isTopLevel = !target.parentId;
+-    target.name = name;
+-    delete target.text;
+-    target.message = text;
+-
+-    if (isTopLevel) {
+-      target.category = isValidCategory(req.body.category)
+-        ? req.body.category
+-        : postCategory(normalizeMessage(target));
+-    }
++      await writeMessages(messages);
++
++      if (isTopLevel) {
++        return `/threads/${target.id}`;
++      }
+ 
+-    await writeMessages(messages);
++      return `/threads/${findRootThreadId(messages, target.id)}#message-${target.id}`;
++    });
+ 
+-    if (isTopLevel) {
+-      res.redirect(`/threads/${target.id}`);
++    if (!redirectTo) {
++      res.status(404).send('Message not found.');
+       return;
+     }
+ 
+-    const rootThreadId = findRootThreadId(messages, target.id);
+-    res.redirect(`/threads/${rootThreadId}#message-${target.id}`);
++    res.redirect(redirectTo);
+   } catch (error) {
+     next(error);
+   }
+@@ -978,7 +1022,6 @@
+ // referenced (keeps ESLint happy). Secret values are never returned.
+ app.get("/lab/status", (req, res) => {
+   res.json({
+-    adminPasswordConfigured: adminPassword.length > 0,
+     apiKeyConfigured: apiKey.length > 0,
+     sampleHash: createWeakHash("demo")
+   });
+@@ -1012,16 +1055,38 @@
+   res.send(renderAdminLoginPage());
+ });
+ 
++// Compare secrets in constant time. Hashing first gives both buffers the same
++// length, which crypto.timingSafeEqual requires.
++function safeEqual(a, b) {
++  const left = crypto.createHash('sha256').update(String(a)).digest();
++  const right = crypto.createHash('sha256').update(String(b)).digest();
++  return crypto.timingSafeEqual(left, right);
++}
++
+ app.post("/admin/login", (req, res) => {
+-  const password = req.body.password;
+-  const message = password === adminPassword
+-    ? "Admin login succeeded."
+-    : "Admin login failed.";
++  const password = typeof req.body.password === 'string' ? req.body.password : '';
++
++  // Fail closed: with no ADMIN_PASSWORD configured, nothing can log in.
++  // Before this fix, the "" fallback let an empty password succeed.
++  if (!adminPassword) {
++    res.status(503).send(renderAdminLoginPage('Admin login is disabled: no admin password is configured.'));
++    return;
++  }
+ 
+-  res.send(renderAdminLoginPage(message));
++  if (!safeEqual(password, adminPassword)) {
++    res.status(401).send(renderAdminLoginPage('Admin login failed.'));
++    return;
++  }
++
++  res.send(renderAdminLoginPage('Admin login succeeded.'));
+ });
+ 
+ app.use((error, req, res, _next) => {
++  if (error.type === 'entity.too.large') {
++    res.status(413).send('Request body is too large.');
++    return;
++  }
++
+   console.error(error);
+   res.status(500).send('Something went wrong.');
+ });
