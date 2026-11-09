@@ -11,7 +11,7 @@ Raw test output is in [`evidence/`](evidence/).
 
 | ID | Issue | Evidence before the fix | After the fix |
 |---|---|---|---|
-| F1 | Admin login fails open when `ADMIN_PASSWORD` is not set | `password=` (empty) returns "Admin login succeeded" | Login disabled (HTTP 503) until a password is configured; constant-time comparison |
+| F1 | Demo admin login fails open when `ADMIN_PASSWORD` is not set | `password=` (empty) returns "Admin login succeeded" | Login disabled (HTTP 503) until a password is configured; constant-time comparison |
 | F2 | `/lab/status` reveals whether an admin password is set | Returns `adminPasswordConfigured: false`, signalling that F1 is exploitable | Field removed |
 | F3 | Length limits enforced only on edit; create and reply rely on HTML `maxlength` | A 90,000-character post is accepted (HTTP 302) and stored; a missing field crashes the handler (HTTP 500) | One server-side validator for create, reply and edit (HTTP 400); 32 KB request-body cap (HTTP 413) |
 | F4 | Unlocked read-modify-write on a JSON file, with non-atomic writes | 50 concurrent posts: 32 return 302 and 18 return 500 (`SyntaxError: Unexpected end of JSON input`); only 11 are stored | All 50 return 302, all 50 are stored, and every ID is unique |
@@ -36,6 +36,8 @@ const message = password === adminPassword ? "Admin login succeeded." : "Admin l
 ```
 
 With the variable unset, submitting an empty password compares `"" === ""` and succeeds. In other words, the fix for one vulnerability introduced another.
+
+The demo login does not create a session, so this is a broken authentication check, not a path to privileged access.
 
 **Fix:**
 
@@ -77,7 +79,7 @@ Every write route read the whole JSON array, changed it, and wrote it back, with
 - **Atomic writes:** each write goes to a temporary file in the same directory and is then renamed over the data file, so readers always see a complete file.
 - **Unique IDs:** IDs come from `crypto.randomUUID()`.
 
-Duplicate IDs were not observed during testing. The UUID change removes the possibility by design.
+Duplicate IDs were not observed during testing. The UUID change is preventive: it makes collisions practically impossible.
 
 ## Verification
 
@@ -90,7 +92,7 @@ APP_FILE=app.original.js node --test --test-reporter=tap test/security.test.js  
 node --test --test-reporter=tap test/security.test.js                            # after
 ```
 
-The full application source is kept private and is available on request.
+The full application source is kept private and is available on request, so the tests cannot be run from this repository alone. The captured output of both runs is in [`evidence/`](evidence/).
 
 ## Limitations
 
